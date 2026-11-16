@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useMemo, createContext, useContext } from 'react';
 import {
+  createUserWithEmailAndPassword,
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  updateProfile,
+} from 'firebase/auth';
+import { auth, listenForPushMessages, enablePushNotifications } from './firebase.js';
+import {
   Wallet, Users, Plus, ArrowUpRight, ArrowDownLeft, CheckCircle2, Clock,
   PieChart, BarChart3, Receipt, Settings, Bell, Search, Filter, Download,
   LogOut, Moon, Sun, Share2, Trash2, Edit3, Check, X, ChevronRight,
@@ -401,10 +412,8 @@ function AppProvider({ children }) {
     return saved ? saved === 'dark' : false;
   });
 
-  const [currentUser, setCurrentUser] = useState(() => {
-    const savedUser = localStorage.getItem('apnahissa_user');
-    return savedUser ? JSON.parse(savedUser) : INITIAL_USERS[0];
-  });
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
 
   const [users, setUsers] = useState(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -432,6 +441,7 @@ function AppProvider({ children }) {
   });
 
   const [toasts, setToasts] = useState([]);
+  const usersRef = React.useRef(users);
 
   useEffect(() => {
     localStorage.setItem(
@@ -450,12 +460,75 @@ function AppProvider({ children }) {
   }, [darkMode]);
 
   useEffect(() => {
-    if (currentUser) {
-      localStorage.setItem('apnahissa_user', JSON.stringify(currentUser));
-    } else {
-      localStorage.removeItem('apnahissa_user');
-    }
-  }, [currentUser]);
+    usersRef.current = users;
+  }, [users]);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (!firebaseUser) {
+        setCurrentUser(null);
+        setAuthReady(true);
+        return;
+      }
+
+      const email = firebaseUser.email || '';
+      const existingUser = usersRef.current.find(
+        (user) => user.email.toLowerCase() === email.toLowerCase()
+      );
+      const appUser = existingUser || {
+        id: firebaseUser.uid,
+        name: firebaseUser.displayName || email.split('@')[0] || 'ApnaHissa User',
+        email,
+        phone: firebaseUser.phoneNumber || '',
+        avatar: (firebaseUser.displayName || email)
+          .split(' ')
+          .map((part) => part[0])
+          .join('')
+          .toUpperCase()
+          .slice(0, 2),
+        color: 'bg-teal-600',
+      };
+
+      if (!existingUser) {
+        usersRef.current = [...usersRef.current, appUser];
+        setUsers(usersRef.current);
+      }
+      setCurrentUser(appUser);
+      setAuthReady(true);
+    });
+
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unsubscribe;
+
+    listenForPushMessages((payload) => {
+      const notification = payload.notification || payload.data || {};
+      setNotifications((previous) => [
+        {
+          id: payload.messageId || `push_${Date.now()}`,
+          title: notification.title || 'ApnaHissa notification',
+          message: notification.body || 'You have a new update.',
+          time: 'Just now',
+          read: false,
+          type: 'push',
+        },
+        ...previous,
+      ]);
+    }).then((stopListening) => {
+      if (active) unsubscribe = stopListening;
+      else stopListening();
+    }).catch((error) => {
+      console.error('Unable to listen for Firebase push messages:', error);
+    });
+
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, []);
 
   const addToast = (message, type = 'success') => {
     const id = Date.now().toString();
@@ -498,6 +571,7 @@ function AppProvider({ children }) {
         setDarkMode,
         currentUser,
         setCurrentUser,
+        authReady,
         users,
         setUsers,
         groups,
@@ -549,59 +623,73 @@ const useApp = () => useContext(AppContext);
 function AuthScreen() {
   const { users, setUsers, setCurrentUser, addToast } = useApp();
   const [mode, setMode] = useState('login'); // login | register | forgot
-  const [email, setEmail] = useState('aarav@apnahissa.app');
-  const [password, setPassword] = useState('••••••••••••');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    if (mode === 'forgot') {
-      addToast(`Password reset link sent to ${email}`, 'info');
-      setMode('login');
-      return;
-    }
 
-    if (mode === 'register') {
-      if (!name.trim() || !email.trim()) {
-        addToast('Please fill in your full name and email.', 'error');
+    setIsSubmitting(true);
+    try {
+      if (mode === 'forgot') {
+        await sendPasswordResetEmail(auth, email.trim());
+        addToast(`Password reset link sent to ${email.trim()}`, 'info');
+        setMode('login');
         return;
       }
-      const existing = users.find((u) => u.email.toLowerCase() === email.toLowerCase());
-      if (existing) {
-        setCurrentUser(existing);
-        addToast(`Welcome back, ${existing.name}!`);
+
+      if (mode === 'register') {
+        if (!name.trim()) {
+          addToast('Please enter your full name.', 'error');
+          return;
+        }
+
+        const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        await updateProfile(credential.user, { displayName: name.trim() });
+        const initials = name
+          .trim()
+          .split(/\s+/)
+          .map((part) => part[0])
+          .join('')
+          .toUpperCase()
+          .slice(0, 2);
+        const newUser = {
+          id: credential.user.uid,
+          name: name.trim(),
+          email: credential.user.email || email.trim(),
+          phone: phone.trim(),
+          avatar: initials || 'US',
+          color: 'bg-teal-600',
+        };
+        setUsers((prev) => prev.some((user) => user.id === newUser.id) ? prev : [...prev, newUser]);
+        setCurrentUser(newUser);
+        addToast(`Account created! Welcome to ApnaHissa, ${newUser.name}.`);
         return;
       }
-      const initials = name
-        .split(' ')
-        .map((n) => n[0])
-        .join('')
-        .toUpperCase()
-        .slice(0, 2);
-      const newUser = {
-        id: 'u_' + Date.now(),
-        name: name.trim(),
-        email: email.trim(),
-        phone: phone.trim() || '+91 90000 00000',
-        avatar: initials || 'US',
-        color: 'bg-teal-600',
-      };
-      setUsers((prev) => [...prev, newUser]);
-      setCurrentUser(newUser);
-      addToast(`Account created! Welcome to ApnaHissa, ${newUser.name}.`);
-      return;
-    }
 
-    // Login
-    const matched = users.find((u) => u.email.toLowerCase() === email.toLowerCase()) || users[0];
-    setCurrentUser(matched);
-    addToast(`Signed in as ${matched.name}`);
+      const credential = await signInWithEmailAndPassword(auth, email.trim(), password);
+      const signedInName = credential.user.displayName || credential.user.email;
+      addToast(`Signed in as ${signedInName}`);
+    } catch (error) {
+      addToast(error.message || 'Firebase authentication failed.', 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
-  const handleGoogleSignIn = () => {
-    setCurrentUser(users[0]);
-    addToast('Signed in with Google (Aarav Sharma)');
+  const handleGoogleSignIn = async () => {
+    setIsSubmitting(true);
+    try {
+      await signInWithPopup(auth, new GoogleAuthProvider());
+      addToast('Signed in with Google.');
+    } catch (error) {
+      addToast(error.message || 'Google sign-in failed.', 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -627,6 +715,7 @@ function AuthScreen() {
             <button
               type="button"
               onClick={handleGoogleSignIn}
+              disabled={isSubmitting}
               className="w-full flex items-center justify-center gap-3 py-2.5 px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-750 text-slate-700 dark:text-slate-200 font-medium text-sm transition shadow-sm"
             >
               <svg className="w-5 h-5" viewBox="0 0 24 24">
@@ -724,7 +813,8 @@ function AuthScreen() {
               </div>
               <input
                 type="password"
-                required
+                required={mode !== 'forgot'}
+                minLength={mode === 'register' ? 6 : undefined}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:ring-2 focus:ring-emerald-500 outline-none"
@@ -734,11 +824,16 @@ function AuthScreen() {
 
           <button
             type="submit"
+            disabled={isSubmitting}
             className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold text-sm shadow-md shadow-emerald-600/20 transition"
           >
-            {mode === 'login' && 'Sign In to ApnaHissa'}
-            {mode === 'register' && 'Create Free Account'}
-            {mode === 'forgot' && 'Send Reset Link'}
+            {isSubmitting
+              ? 'Please wait...'
+              : mode === 'login'
+              ? 'Sign In to ApnaHissa'
+              : mode === 'register'
+              ? 'Create Free Account'
+              : 'Send Reset Link'}
           </button>
         </form>
 
@@ -1881,6 +1976,10 @@ function MainApp() {
   const [settlePrefill, setSettlePrefill] = useState(null);
   const [showGroupModal, setShowGroupModal] = useState(false);
   const [showNotifDrawer, setShowNotifDrawer] = useState(false);
+  const [pushToken, setPushToken] = useState(
+    () => localStorage.getItem('apnahissa_fcm_token') || ''
+  );
+  const [isEnablingPush, setIsEnablingPush] = useState(false);
 
   // Filters for Personal Expense History
   const [searchQuery, setSearchQuery] = useState('');
@@ -2889,6 +2988,37 @@ function MainApp() {
           </div>
         </div>
 
+        <div className="pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-bold text-slate-900 dark:text-white">Push Notifications</p>
+            <p className="text-xs text-slate-500">
+              {pushToken
+                ? 'Push notifications are enabled for this browser.'
+                : 'Allow this browser to receive ApnaHissa notifications.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={isEnablingPush || !!pushToken}
+            onClick={async () => {
+              setIsEnablingPush(true);
+              try {
+                const token = await enablePushNotifications();
+                localStorage.setItem('apnahissa_fcm_token', token);
+                setPushToken(token);
+                addToast('Push notifications enabled for this browser.');
+              } catch (error) {
+                addToast(error.message || 'Unable to enable push notifications.', 'error');
+              } finally {
+                setIsEnablingPush(false);
+              }
+            }}
+            className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-bold hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            {isEnablingPush ? 'Enabling...' : pushToken ? 'Enabled' : 'Enable Notifications'}
+          </button>
+        </div>
+
         <div className="pt-4 border-t border-slate-100 dark:border-slate-800">
           <p className="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
             Switch Active User Perspective (Test Multi-User Settlement Flow)
@@ -2980,7 +3110,14 @@ function MainApp() {
             </div>
           </div>
           <button
-            onClick={() => setCurrentUser(null)}
+            onClick={async () => {
+              try {
+                await signOut(auth);
+                setCurrentUser(null);
+              } catch (error) {
+                addToast(error.message || 'Sign out failed.', 'error');
+              }
+            }}
             className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-xl border border-slate-200 dark:border-slate-800 text-xs font-semibold text-slate-600 dark:text-slate-400 hover:text-rose-600 hover:border-rose-300 transition"
           >
             <LogOut className="w-3.5 h-3.5" /> Sign Out
@@ -3105,7 +3242,14 @@ function MainApp() {
 // 11. ROOT ENTRY POINT
 // ============================================================================
 function RootRouter() {
-  const { currentUser } = useApp();
+  const { currentUser, authReady } = useApp();
+  if (!authReady) {
+    return (
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center">
+        <div className="h-8 w-8 animate-spin rounded-full border-4 border-emerald-600 border-t-transparent" />
+      </div>
+    );
+  }
   return currentUser ? <MainApp /> : <AuthScreen />;
 }
 
